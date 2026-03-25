@@ -1,4 +1,5 @@
 import csv
+import io
 import json
 import os
 import sqlite3
@@ -12,15 +13,65 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(BASE_DIR, 'attendance.db')
 STUDENTS_FILE = os.path.join(BASE_DIR, 'students.csv')
 SERVER_URL = os.environ.get('ATTENDANCE_SERVER_URL', 'http://127.0.0.1:5000')
-REMOTE_API_BASE_URL = os.environ.get('REMOTE_API_BASE_URL', 'http://127.0.0.1:3000').rstrip('/')
+REMOTE_API_BASE_URL = os.environ.get('REMOTE_API_BASE_URL', 'https://new-data2.onrender.com').rstrip('/')
+REMOTE_STUDENTS_CSV_URL = os.environ.get(
+    'REMOTE_STUDENTS_CSV_URL',
+    'https://docs.google.com/spreadsheets/d/11szmicddC2FZeLsgM4DZXzA87zBNgeSOvDwQ_-2gKWU/export?format=csv&gid=0',
+).strip()
 REMOTE_SYNC_CACHE_FILE = os.path.join(BASE_DIR, 'remote_user_sync_cache.json')
+REMOTE_STUDENTS_CACHE_SECONDS = 60
+REMOTE_STUDENTS_RETRY_SECONDS = 15
 SUCCESS_DISPLAY_SECONDS = 3
 ERROR_DISPLAY_SECONDS = 2
 RECENT_SCAN_COOLDOWN_SECONDS = 3
 QR_DETECTOR = cv2.QRCodeDetector()
+REMOTE_STUDENTS_CACHE = {
+    "students": None,
+    "expires_at": datetime.min,
+}
 
 
-def load_students():
+def fetch_remote_students():
+    if not REMOTE_API_BASE_URL and not REMOTE_STUDENTS_CSV_URL:
+        return {}
+
+    now = datetime.utcnow()
+    cached_students = REMOTE_STUDENTS_CACHE.get("students")
+    if cached_students is not None and now < REMOTE_STUDENTS_CACHE.get("expires_at", datetime.min):
+        return cached_students
+
+    students = {}
+    try:
+        if REMOTE_STUDENTS_CSV_URL:
+            response = requests.get(REMOTE_STUDENTS_CSV_URL, timeout=5)
+            if response.ok:
+                csv_text = response.content.decode('utf-8-sig')
+                reader = csv.DictReader(io.StringIO(csv_text))
+                for row in reader:
+                    student_id = str(row.get('student_id', '')).strip()
+                    name = str(row.get('name') or row.get('full_name') or '').strip()
+                    if student_id and name:
+                        students[student_id] = name
+
+        if not students and REMOTE_API_BASE_URL:
+            response = requests.get(f"{REMOTE_API_BASE_URL}/api/users", timeout=5)
+            data = response.json()
+            if response.ok and isinstance(data, list):
+                for row in data:
+                    student_id = str(row.get('user_id', '')).strip()
+                    name = str(row.get('full_name') or row.get('name') or '').strip()
+                    if student_id and name:
+                        students[student_id] = name
+    except (requests.RequestException, ValueError):
+        students = {}
+
+    cache_seconds = REMOTE_STUDENTS_CACHE_SECONDS if students else REMOTE_STUDENTS_RETRY_SECONDS
+    REMOTE_STUDENTS_CACHE["students"] = students
+    REMOTE_STUDENTS_CACHE["expires_at"] = now + timedelta(seconds=cache_seconds)
+    return students
+
+
+def load_local_students():
     students = {}
     try:
         with open(STUDENTS_FILE, 'r', encoding='utf-8-sig', newline='') as csv_file:
@@ -35,6 +86,16 @@ def load_students():
     except Exception as e:
         print(f"ERROR: failed to read students: {e}")
     return students
+
+
+def load_students():
+    remote_students = fetch_remote_students()
+    local_students = load_local_students()
+    if remote_students:
+        merged_students = dict(remote_students)
+        merged_students.update(local_students)
+        return merged_students
+    return local_students
 
 
 def ensure_attendance_table():
@@ -241,12 +302,12 @@ def draw_qr_box(frame, qr_points, color):
         )
 
 
-if not os.path.exists(STUDENTS_FILE):
+if not REMOTE_STUDENTS_CSV_URL and not os.path.exists(STUDENTS_FILE):
     raise SystemExit("ERROR: students.csv not found")
 
 students = load_students()
 if not students:
-    raise SystemExit("ERROR: no students found in students.csv")
+    raise SystemExit("ERROR: no students found in remote or local student source")
 
 
 def main():
@@ -299,6 +360,7 @@ def main():
                         print("QR is invalid, already used, or expired")
                         break
 
+                    students = load_students()
                     student_name = students.get(student_id)
                     if not student_name:
                         error_message = f"STUDENT NOT FOUND: {student_id}"

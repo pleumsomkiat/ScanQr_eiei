@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import csv
+import io
 import os
 import socket
 import sqlite3
@@ -14,9 +15,19 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(BASE_DIR, 'attendance.db')
 STUDENTS_FILE = os.path.join(BASE_DIR, 'students.csv')
 QR_TOKEN_TTL_SECONDS = 60
-REMOTE_API_BASE_URL = os.environ.get('REMOTE_API_BASE_URL', 'http://127.0.0.1:3000').rstrip('/')
+REMOTE_API_BASE_URL = os.environ.get('REMOTE_API_BASE_URL', 'https://new-data2.onrender.com').rstrip('/')
+REMOTE_STUDENTS_CSV_URL = os.environ.get(
+    'REMOTE_STUDENTS_CSV_URL',
+    'https://docs.google.com/spreadsheets/d/11szmicddC2FZeLsgM4DZXzA87zBNgeSOvDwQ_-2gKWU/export?format=csv&gid=0',
+).strip()
+REMOTE_STUDENTS_CACHE_SECONDS = 60
+REMOTE_STUDENTS_RETRY_SECONDS = 15
 LAST_SCAN = {"student_id": "รอสแกน QR...", "student_name": "กำลังรอการเช็คชื่อ..."}
 QR_TOKEN_MAP = {}
+REMOTE_STUDENTS_CACHE = {
+    "students": None,
+    "expires_at": datetime.min,
+}
 
 
 def get_db_connection():
@@ -44,7 +55,53 @@ def ensure_attendance_table():
     conn.close()
 
 
-def load_students():
+def fetch_remote_students():
+    if not REMOTE_API_BASE_URL and not REMOTE_STUDENTS_CSV_URL:
+        return {}
+
+    now = datetime.utcnow()
+    cached_students = REMOTE_STUDENTS_CACHE.get("students")
+    if cached_students is not None and now < REMOTE_STUDENTS_CACHE.get("expires_at", datetime.min):
+        return cached_students
+
+    students = {}
+    try:
+        if REMOTE_STUDENTS_CSV_URL:
+            response = requests.get(REMOTE_STUDENTS_CSV_URL, timeout=5)
+            if response.ok:
+                csv_text = response.content.decode('utf-8-sig')
+                reader = csv.DictReader(io.StringIO(csv_text))
+                for row in reader:
+                    student_id = str(row.get('student_id', '')).strip()
+                    name = str(row.get('name') or row.get('full_name') or '').strip()
+                    if student_id and name:
+                        students[student_id] = {
+                            "student_id": student_id,
+                            "name": name,
+                        }
+
+        if not students and REMOTE_API_BASE_URL:
+            response = requests.get(f"{REMOTE_API_BASE_URL}/api/users", timeout=5)
+            data = response.json()
+            if response.ok and isinstance(data, list):
+                for row in data:
+                    student_id = str(row.get('user_id', '')).strip()
+                    name = str(row.get('full_name') or row.get('name') or '').strip()
+                    if student_id and name:
+                        students[student_id] = {
+                            "student_id": student_id,
+                            "name": name,
+                        }
+    except (requests.RequestException, ValueError):
+        students = {}
+
+    cache_seconds = REMOTE_STUDENTS_CACHE_SECONDS if students else REMOTE_STUDENTS_RETRY_SECONDS
+    REMOTE_STUDENTS_CACHE["students"] = students
+    REMOTE_STUDENTS_CACHE["expires_at"] = now + timedelta(seconds=cache_seconds)
+    return students
+
+
+def load_local_students():
     students = {}
     if not os.path.exists(STUDENTS_FILE):
         return students
@@ -60,6 +117,16 @@ def load_students():
                     "name": name,
                 }
     return students
+
+
+def load_students():
+    remote_students = fetch_remote_students()
+    local_students = load_local_students()
+    if remote_students:
+        merged_students = dict(remote_students)
+        merged_students.update(local_students)
+        return merged_students
+    return local_students
 
 
 def get_ip_address():
@@ -99,9 +166,9 @@ def fetch_remote_history():
         for item in data:
             user_id = str(item.get('user_id', '')).strip()
             name = (
-                item.get('full_name')
+                students.get(user_id, {}).get('name')
+                or item.get('full_name')
                 or item.get('name')
-                or students.get(user_id, {}).get('name')
                 or user_id
             )
             normalized.append({
