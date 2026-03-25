@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+*.log
+attendance.db
+remote_user_sync_cache.json
